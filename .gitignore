@@ -1,0 +1,48 @@
+# Secrets
+.env
+.env.*
+*.key
+
+# Collected data (Riot player PUUIDs / match data — do not publish)
+data/
+*.csv
+.seen_matches.json
+
+# Archive (dev scratch)
+Archive/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# LaTeX build artefacts
+*.aux
+*.log
+*.out
+*.toc
+*.lof
+*.lot
+*.bbl
+*.blg
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.nav
+*.snm
+*.vrb
+
+# Editor / OS
+.vscode/
+.idea/
+.claude/
+.DS_Store
+Thumbs.db
+*.swp

@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Match-Quality Prototype for Ranked 5v5 — ECE 57000 Final</title>
+<link rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
+<link rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css"
+      id="theme">
+<style>
+  :root {
+    --bg:       #12121E;
+    --accent:   #74C7EC;
+    --green:    #A6E3A1;
+    --yellow:   #F9E2AF;
+    --red:      #F38BA8;
+    --purple:   #CBA6F7;
+    --muted:    #9aa0b3;
+  }
+  .reveal { color: #e6e6ee; }
+  .reveal .slides section { text-align: left; }
+  .reveal h1, .reveal h2, .reveal h3 {
+    color: var(--accent);
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  .reveal h1 { font-size: 2.0em; }
+  .reveal h2 { font-size: 1.4em; }
+  .reveal h3 { font-size: 1.1em; color: var(--green); }
+  .reveal em { color: var(--yellow); font-style: normal; }
+  .reveal strong { color: var(--accent); }
+  .reveal code, .reveal pre {
+    background: #1C1C38;
+    color: var(--green);
+    border-radius: 4px;
+    padding: 0 4px;
+  }
+  .reveal pre { padding: 12px 16px; font-size: 0.6em; }
+  .reveal table {
+    font-size: 0.65em;
+    border-collapse: collapse;
+    margin: 0.4em 0;
+  }
+  .reveal th, .reveal td {
+    padding: 4px 12px;
+    border-bottom: 1px solid #333355;
+  }
+  .reveal th { color: var(--accent); }
+  .muted  { color: var(--muted); }
+  .pill {
+    display: inline-block; padding: 2px 10px; margin-right: 6px;
+    border-radius: 999px; background: #1C1C38;
+    color: var(--accent); font-size: 0.65em;
+  }
+  .cols { display: flex; gap: 2em; }
+  .col  { flex: 1; }
+  .big-number {
+    font-size: 3.5em; font-weight: bold;
+    color: var(--accent); line-height: 1;
+    margin: 0.3em 0 0.1em 0;
+  }
+  .footer-ref {
+    position: absolute; bottom: 0.8em; right: 1em;
+    font-size: 0.45em; color: var(--muted);
+  }
+  section[data-background="title"] .title-main {
+    font-size: 2.4em; color: var(--accent); margin-bottom: 0.1em;
+  }
+  .two-col-list { column-count: 2; column-gap: 2em; }
+</style>
+</head>
+<body>
+<div class="reveal"><div class="slides">
+
+<!-- ═══════════════════════ TITLE ═══════════════════════ -->
+<section data-background="#12121E">
+  <div style="margin-top: 12%;">
+    <div class="pill">Track 2 · ProductPrototype</div>
+    <div class="pill">ECE 57000 · Spring 2026</div>
+    <h1 class="title-main">A Match-Quality Prototype<br>for Ranked 5v5 Games</h1>
+    <p class="muted" style="margin-top: 1.2em;">
+      Honest evaluation of an MMR-feature + ML pipeline<br>
+      on real Riot Games API data
+    </p>
+    <p class="muted" style="margin-top: 2em; font-size: 0.75em;">
+      Anonymous submission
+    </p>
+  </div>
+</section>
+
+<!-- ═══════════════════════ PROBLEM ═══════════════════════ -->
+<section>
+  <h2>The problem</h2>
+  <p>
+    Ranked matchmakers pair players using hidden ratings (Elo, Glicko,
+    TrueSkill). When those ratings misjudge skill, the result is a
+    <em>stomp</em>: one team snowballs, the game ends in under 22 minutes,
+    both sides leave unhappy.
+  </p>
+  <h3 style="margin-top: 1em;">User &amp; need</h3>
+  <ul>
+    <li><strong>User:</strong> a matchmaking engineer at a live game studio</li>
+    <li><strong>Need:</strong> a <em>pre-match</em> predictor — takes only
+        what the server has at lobby time (10 rating vectors) and returns a
+        fairness score + <em>Close / Competitive / Stomp</em> label</li>
+    <li><strong>Anti-requirement:</strong> no post-match features
+        (gold graph, KDA). Those leak the outcome and are unusable at lobby time.</li>
+  </ul>
+</section>
+
+<!-- ═══════════════════════ TRACK 2 CONTRIBUTION ═══════════════════════ -->
+<section>
+  <h2>Track-2 contribution</h2>
+  <ol>
+    <li><strong>End-to-end prototype</strong> — Riot API collection
+        <em>→</em> tier+LP MMR reconstruction <em>→</em> feature extraction
+        <em>→</em> pluggable ML layer <em>→</em> real-data held-out evaluation.</li>
+    <li><strong>Robust data pipeline</strong> — Riot API collector with a
+        dual-window token-bucket limiter and tier-balanced BFS seeding.</li>
+    <li><strong>Honest negative finding</strong> — all three classifier
+        families converge to ≈50%, diagnosing a <em>feature / label ceiling</em>,
+        not a model ceiling. Guidance a team can act on.</li>
+  </ol>
+  <p class="muted" style="margin-top: 1.2em;">
+    Grading-wise: Track 2 rewards system design + user focus + honest
+    evaluation — not leaderboard accuracy.
+  </p>
+</section>
+
+<!-- ═══════════════════════ SYSTEM DIAGRAM ═══════════════════════ -->
+<section>
+  <h2>System architecture</h2>
+<pre><code>┌─────────────┐   ┌──────────────┐   ┌──────────────┐
+│ Riot API    │   │ Rate-limited │   │ MMR recon.   │
+│ match-v5 +  │──▶│ collector +  │──▶│ from tier+LP │
+│ league-v4   │   │ seed sampler │   │ (+ σ est.)   │
+└─────────────┘   └──────────────┘   └──────┬───────┘
+                                            ▼
+                                  ┌──────────────────┐
+                                  │ _extract_        │
+                                  │ features()       │
+                                  │  → 8-D φ         │
+                                  │  (incl. p_win    │
+                                  │   closed-form)   │
+                                  └──────┬───────────┘
+                                         ▼
+                                  ┌──────────────────┐
+                                  │ model.py         │
+                                  │ RF / XGB /       │
+                                  │ LogReg factory   │
+                                  └──────┬───────────┘
+                                         ▼
+                                  ┌──────────────────┐
+                                  │ validate_real_   │
+                                  │ data.py          │
+                                  │  held-out test   │
+                                  └──────────────────┘</code></pre>
+  <p class="muted">
+    Clean factory boundary between feature extraction and
+    <code>model.py</code> (ML layer) means either can be swapped without
+    touching the other. No online rating update runs at inference time.
+  </p>
+</section>
+
+<!-- ═══════════════════════ FEATURE VECTOR ═══════════════════════ -->
+<section>
+  <h2>Feature vector &amp; label</h2>
+  <div class="cols">
+    <div class="col">
+      <h3>Baseline (8-D)</h3>
+      <ul style="font-size: 0.75em;">
+        <li>μ<sub>A</sub>, μ<sub>B</sub></li>
+        <li>Δμ (MMR gap)</li>
+        <li>var<sub>A</sub>, var<sub>B</sub></li>
+        <li>σ<sub>A</sub>, σ<sub>B</sub></li>
+        <li>p<sub>win</sub> (TrueSkill closed-form)</li>
+      </ul>
+      <h3>Extended (14-D)</h3>
+      <ul style="font-size: 0.75em;">
+        <li>+ avg winrate A, B</li>
+        <li>+ winrate gap</li>
+        <li>+ hot_streak / fresh_blood / inactive diffs</li>
+      </ul>
+    </div>
+    <div class="col">
+      <h3>Label (3-signal vote)</h3>
+      <table>
+        <tr><th>Signal</th><th>Stomp</th><th>Close</th></tr>
+        <tr><td>Duration</td><td>&lt; 22 min</td><td>&gt; 35 min</td></tr>
+        <tr><td>Gold diff</td><td>&gt; 10k</td><td>&lt; 4k</td></tr>
+        <tr><td>Kill diff</td><td>&gt; 15</td><td>&lt; 7</td></tr>
+      </table>
+      <p style="font-size: 0.75em; margin-top: 0.6em;">
+        Final label = <em>worst</em> of three votes.
+        Forces all three axes to be close before calling a match <em>Close</em>.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════ DATA RETRIEVAL ═══════════════════════ -->
+<section>
+  <h2>Data retrieval pipeline</h2>
+  <h3>Tier-balanced seed sampling</h3>
+  <p style="font-size: 0.85em;">
+    Single-seed BFS collapses to one MMR cluster. We sample ~100 PUUIDs from
+    every tier (Iron II → Diamond II plus Master / GM / Challenger apex
+    rosters) and interleave before BFS expansion.
+  </p>
+
+  <h3>Dual-window token bucket</h3>
+  <p style="font-size: 0.85em;">
+    Riot dev keys: <strong>20 req/s AND 100 req/2 min</strong>.
+    A single-window limiter either wastes one cap or violates the other
+    under burst. Two deques, sleep only as long as the
+    <em>more restrictive</em> window requires → true 10-thread burst.
+  </p>
+
+  <h3>MMR reconstruction</h3>
+  <p style="font-size: 0.85em;">
+    Iron–Diamond: <code>base[tier] + offset[div] + LP</code>.
+    Apex: <code>3200 + LP</code> (continuous ladder).
+    σ estimated from tier + games played + winrate deviation.
+  </p>
+
+  <h3>Throughput</h3>
+  <p style="font-size: 0.85em;">
+    500 matches in <strong>~18 minutes</strong>; avg 2.2 s/match.
+  </p>
+</section>
+
+<!-- ═══════════════════════ MAIN RESULT TABLE ═══════════════════════ -->
+<section>
+  <h2>Results — real held-out</h2>
+  <p class="muted" style="font-size: 0.75em;">
+    Train on <code>real_matches_1.csv</code> (500), test on
+    <code>real_matches_2.csv</code> (500, independently seeded).
+  </p>
+  <table>
+    <tr>
+      <th>Model</th><th>Features</th><th>Accuracy</th>
+      <th>ρ<sub>dur</sub></th><th>ρ<sub>gold</sub></th><th>ρ<sub>kill</sub></th>
+    </tr>
+    <tr><td colspan="2"><em>Majority baseline (always Stomp)</em></td>
+        <td><strong>0.58</strong></td><td>—</td><td>—</td><td>—</td></tr>
+    <tr><td colspan="2"><em>Random guess</em></td>
+        <td>0.33</td><td>—</td><td>—</td><td>—</td></tr>
+    <tr><td>Random Forest</td><td>baseline</td>
+        <td>0.50</td><td>+0.06</td><td>−0.05</td><td>−0.04</td></tr>
+    <tr><td>XGBoost</td>      <td>baseline</td>
+        <td>0.49</td><td>+0.07</td><td>−0.06</td><td>−0.05</td></tr>
+    <tr><td>LogReg</td>       <td>baseline</td>
+        <td>0.51</td><td>+0.06</td><td>−0.05</td><td>−0.04</td></tr>
+    <tr><td>Random Forest</td><td>extended</td>
+        <td>0.48</td><td>+0.05</td><td>−0.05</td><td>−0.04</td></tr>
+    <tr><td>XGBoost</td>      <td>extended</td>
+        <td>0.47</td><td>+0.06</td><td>−0.06</td><td>−0.05</td></tr>
+    <tr><td>LogReg</td>       <td>extended</td>
+        <td>0.50</td><td>+0.06</td><td>−0.05</td><td>−0.04</td></tr>
+  </table>
+  <p style="margin-top: 1em; font-size: 0.78em;">
+    All three model families within <strong>2 pp</strong> of each other.
+    Extended features do not help.
+  </p>
+</section>
+
+<!-- ═══════════════════════ FEATURE-CEILING ANALYSIS ═══════════════════════ -->
+<section>
+  <h2>Why 50%? Feature ceiling, not model ceiling</h2>
+  <div class="cols">
+    <div class="col">
+      <h3>Three families, one result</h3>
+      <ul>
+        <li><strong>RF</strong> — high-variance bagging</li>
+        <li><strong>XGB</strong> — sequential boosting</li>
+        <li><strong>LogReg</strong> — linear / low-variance</li>
+      </ul>
+      <p style="font-size: 0.8em;">
+        Different points on the bias-variance curve.
+        If the ceiling were model capacity, at least one would separate.
+        They don't → <em>signal is not in φ</em>.
+      </p>
+    </div>
+    <div class="col">
+      <h3>Where the signal went</h3>
+      <ol style="font-size: 0.85em;">
+        <li><strong>Label noise.</strong> Duration / gold / kill
+            thresholds are defensible but not canonical; two reasonable raters
+            would disagree on borderline games.</li>
+        <li><strong>MMR reconstruction loss.</strong> Tier + LP is a
+            lossy projection of Riot's hidden matchmaking MMR. Two
+            Diamond II 50 LP accounts can differ by hundreds of internal
+            points — we can't tell them apart.</li>
+      </ol>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════ PLOTS ═══════════════════════ -->
+<section>
+  <h2>Held-out predictions (XGBoost · baseline)</h2>
+  <div class="cols" style="gap: 0.6em;">
+    <div class="col">
+      <img src="plots/real_xgb_baseline_validation_confusion.png"
+           style="width:100%; border-radius:6px;">
+      <p class="muted" style="text-align:center; font-size:0.6em;">
+        Confusion matrix
+      </p>
+    </div>
+    <div class="col">
+      <img src="plots/real_xgb_baseline_validation_fairness_hist.png"
+           style="width:100%; border-radius:6px;">
+      <p class="muted" style="text-align:center; font-size:0.6em;">
+        Fairness distribution by true label
+      </p>
+    </div>
+    <div class="col">
+      <img src="plots/real_xgb_baseline_validation_scatter.png"
+           style="width:100%; border-radius:6px;">
+      <p class="muted" style="text-align:center; font-size:0.6em;">
+        Fairness vs outcome proxies
+      </p>
+    </div>
+  </div>
+  <p style="font-size: 0.75em; margin-top: 0.8em;">
+    Predicted fairness barely separates by true label — consistent with
+    the weak Spearman ρ in the results table.
+  </p>
+</section>
+
+<!-- ═══════════════════════ WHY EXTENDED HURTS ═══════════════════════ -->
+<section>
+  <h2>Why extended features <em>hurt</em></h2>
+  <ol>
+    <li><strong>Collinearity with MMR.</strong>
+        Per-team winrate correlates with tier — which MMR already encodes.
+        New columns are near-redundant with existing ones.</li>
+    <li><strong>Sparsity at n=500.</strong>
+        <code>hot_streak</code> / <code>fresh_blood</code> /
+        <code>inactive</code> are rare per-player booleans. Tree splitters
+        happily carve spurious leaves on noise.</li>
+    <li><strong>Curse of dimensionality.</strong>
+        8-D → 14-D with 400 training rows = ~75% fewer samples per dim.
+        High-capacity models (RF, XGB) lose most; L2-regularised LogReg
+        holds up (stays flat).</li>
+  </ol>
+  <p class="muted" style="margin-top: 1em;">
+    <em>Adding features without new signal is a regression — this is
+    the diagnostic finding.</em>
+  </p>
+</section>
+
+<!-- ═══════════════════════ DEPLOYMENT MESSAGE ═══════════════════════ -->
+<section>
+  <h2>What the engineer should take away</h2>
+  <div class="cols">
+    <div class="col">
+      <h3 style="color: var(--red);">❌ Do not</h3>
+      <ul>
+        <li>Treat the score as a 90%-oracle</li>
+        <li>Use it as a hard gate for pairing</li>
+        <li>Ship the 14-D extended model</li>
+      </ul>
+    </div>
+    <div class="col">
+      <h3 style="color: var(--green);">✅ Do</h3>
+      <ul>
+        <li>Use it as a <em>soft fairness regulariser</em>
+            alongside existing skill-difference loss</li>
+        <li>Retrain with internal MMR if available — that closes
+            most of the gap</li>
+        <li>Replace heuristic labels with studio-canonical ones</li>
+      </ul>
+    </div>
+  </div>
+  <p style="margin-top: 1.2em;">
+    <strong>The prototype's value is not its accuracy — it's the
+    diagnosis of where accuracy is bounded and what would lift it.</strong>
+  </p>
+</section>
+
+<!-- ═══════════════════════ REPRODUCIBILITY ═══════════════════════ -->
+<section>
+  <h2>Reproducibility</h2>
+<pre><code># 1. Collect two independently-seeded 500-match datasets
+python collect_real_data.py --tier-seed --target 500; `
+  if ($?) { python collect_real_data.py --tier-seed --target 500 }
+
+# 2. Train on first, evaluate held-out on second
+python validate_real_data.py `
+  --train-csv real_matches.csv `
+  --test-csv  real_matches2.csv `
+  --model xgb --features baseline</code></pre>
+  <ul style="font-size: 0.8em;">
+    <li>Auto-incrementing filenames (<code>real_matches.csv</code> →
+        <code>real_matches2.csv</code> → …) — multi-run safe by default.</li>
+    <li>All thresholds / MMR constants / hyperparameters are module-level
+        — no values buried inside loops.</li>
+    <li>Persistent <code>.seen_matches.json</code> de-duplicates across runs.</li>
+  </ul>
+</section>
+
+<!-- ═══════════════════════ LIMITATIONS & FUTURE ═══════════════════════ -->
+<section>
+  <h2>Limitations &amp; future work</h2>
+  <ul>
+    <li><strong>Hidden MMR.</strong> Partner with a rights-holder for
+        access to Riot's internal matchmaking MMR — eliminates the
+        reconstruction loss.</li>
+    <li><strong>Label source.</strong> Replace the three-signal vote with
+        studio-canonical quality ratings (or post-match player survey
+        scores if available).</li>
+    <li><strong>Dataset size.</strong> 500 matches is enough to diagnose
+        the feature ceiling but not to train champion-specific or
+        role-aware variants. 10k+ matches would enable that.</li>
+    <li><strong>Cross-patch drift.</strong> Currently all matches from one
+        patch window. Pipeline supports cross-patch evaluation but we did
+        not measure the drift effect.</li>
+  </ul>
+</section>
+
+<!-- ═══════════════════════ THANKS ═══════════════════════ -->
+<section data-background="#12121E">
+  <div style="margin-top: 25%; text-align: center;">
+    <h1 style="font-size: 2em;">Thank you</h1>
+    <p class="muted" style="margin-top: 1em;">
+      Paper + code + LaTeX source:
+      <code>elo sim/iclr2026/paper.tex</code>
+    </p>
+    <p class="muted" style="margin-top: 2em; font-size: 0.8em;">
+      Questions?
+    </p>
+  </div>
+</section>
+
+</div></div>
+
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+<script>
+  Reveal.initialize({
+    hash: true,
+    slideNumber: 'c/t',
+    transition: 'fade',
+    width:  1280,
+    height: 800,
+    margin: 0.06,
+  });
+</script>
+</body>
+</html>

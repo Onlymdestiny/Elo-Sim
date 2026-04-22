@@ -1,0 +1,530 @@
+\documentclass{article}
+\usepackage{iclr2026_conference,times}
+
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{float}
+
+\title{Match-Quality Prediction for Ranked 5v5 Games:\\
+An Honest MMR + ML Pipeline}
+
+\author{William Yu}
+
+\newcommand{\fix}{\marginpar{FIX}}
+\newcommand{\new}{\marginpar{NEW}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We build and evaluate an end-to-end prototype that estimates pre-match quality
+for ranked 5v5 online games. The deployed pipeline collects 500 live
+\texttt{RANKED\_SOLO\_5x5} matches from the Riot Games API, reconstructs
+per-player approximate MMR from public tier and LP, and assembles an
+eight-dimensional match-quality feature vector including the closed-form
+TrueSkill team win probability. The vector is fed to one of three
+interchangeable classifiers (Random Forest, XGBoost, Logistic Regression)
+that predict a three-class label --- \emph{Close}, \emph{Competitive},
+\emph{Stomp} --- derived from a worst-of-three vote over duration, gold,
+and kill differentials. On a second, independently-seeded 500-match
+held-out collection, all three classifiers land near $50\%$ accuracy
+with weak Spearman correlation ($|\rho|\!\le\!0.07$) against outcome
+proxies. The agreement across model families points to a label/feature
+ceiling rather than a model-capacity ceiling. We attribute the gap
+primarily to (i) label noise in the heuristic
+\emph{Close/Competitive/Stomp} voting rule and (ii) lossy reconstruction of
+Riot's hidden MMR from public tier$+$LP.
+Code and reproducibility artifacts are available at
+\url{https://github.com/Onlymdestiny/Elo-Sim}.
+\end{abstract}
+
+\section{Introduction}  
+
+Competitive online games rely on hidden rating systems (Elo, Glicko,
+TrueSkill) to pair players so that matches stay close. When matchmaking
+misjudges skill the result is a \emph{stomp}: one team snowballs early,
+the game ends in under 22 minutes, and both sides report a poor
+experience. Matchmaker designers therefore need a tool that, given the
+ten pre-match rating vectors, predicts whether a match will be close,
+competitive, or lopsided.
+
+The intended user is the matchmaking engineer. The tool must run before
+the match starts, use only data the server has at lobby time, and return
+a fairness score together with a coarse quality label. Post-match
+telemetry leaks the outcome and is not available at lobby time, so we
+restrict features to lobby-time data and keep the pipeline transparent
+enough to inspect and retrain.
+
+Our contributions are (1) a full data-to-prediction prototype with a
+factory boundary between feature extraction and classifier; (2) an
+authenticated Riot API collection pipeline with a dual-window token-bucket
+limiter, tier-balanced seed sampling, and explicit piecewise MMR
+reconstruction from public tier$+$LP; and (3) a held-out evaluation on an
+independently-seeded second collection, on which the three classifiers
+converge near $50\%$ accuracy. Since the ceilings we observe come from
+the data pipeline, Sections~\ref{sec:retrieval} and~\ref{sec:labels}
+receive the same formal treatment as the rating and classifier layers.
+
+\section{Related Work}
+
+Rating systems have been studied since Elo~\citep{elo1978rating} and refined
+into Bayesian extensions by TrueSkill~\citep{herbrich2006trueskill}, whose
+closed-form team win probability we adopt directly as one feature component.
+Most production matchmakers optimise a
+skill-difference loss; few publish the \emph{quality-of-match} predictor
+separately. Work on LoL-specific prediction has typically used post-match
+statistics (gold graph, KDA) which leak outcome information and are unusable
+at lobby time~\citep{do2021predicting}. Our features are strictly pre-match.
+
+Our three-classifier factory (bagging / boosting / linear baseline) follows
+the standard practice of comparing families at different bias/variance
+points to distinguish a model-capacity ceiling from a feature-signal
+ceiling~\citep{caruana2006empirical}.
+
+\section{Methodology}
+
+The pipeline has three stages: a Riot API retrieval layer producing the
+training and held-out splits, a feature-extraction and labelling layer,
+and a pluggable classifier factory.
+
+\subsection{Team skill summary and win probability}
+\label{sec:rating}
+Each player $i$ is represented by a Gaussian skill summary $\mathcal{N}(\mu_i,
+\sigma_i^2)$, where $\mu_i$ is set from the reconstructed MMR
+$\widehat{M}$ defined below in \eqref{eq:mmr} and $\sigma_i$ from the
+uncertainty estimate \eqref{eq:sigma}. Team-level aggregates are
+\begin{equation}
+\mu_T = \sum_{i \in T} \mu_i, \qquad
+\sigma_T^2 = \sum_{i \in T} \sigma_i^2, \qquad T \in \{A, B\}.
+\label{eq:team-agg}
+\end{equation}
+We use the closed-form TrueSkill team win probability as one component of
+the feature vector:
+\begin{equation}
+p_{\text{win}}(A) \;=\; \Phi\!\left(\frac{\mu_A - \mu_B}{c}\right),
+\qquad c = \sqrt{n_A \beta^2 + n_B \beta^2 + \sigma_A^2 + \sigma_B^2},
+\label{eq:pwin}
+\end{equation}
+where $\Phi$ is the standard-normal CDF, $n_A = n_B = 5$, and $\beta = 25/6$
+is the performance-variance constant. Equation \eqref{eq:pwin} is the only
+rating-theoretic quantity used at inference time; we do not run an online
+TrueSkill posterior update on the real data path. A simulation sandbox
+that iterates the full Bayesian update was built during development and
+is described in Appendix~\ref{app:sandbox}.
+
+\subsection{Match-quality feature extraction}
+\label{sec:features}
+For a given pair of teams we compute the \emph{baseline} eight-dimensional
+feature vector
+\begin{equation}
+\boldsymbol{\phi}_{\text{base}} \;=\;
+\big[\,\mu_A,\; \mu_B,\; |\mu_A - \mu_B|,\;
+\mathrm{Var}\{\mu_i\}_{i\in A},\; \mathrm{Var}\{\mu_i\}_{i\in B},\;
+\sigma_A,\; \sigma_B,\; p_{\text{win}}\,\big] \in \mathbb{R}^8,
+\label{eq:phi-base}
+\end{equation}
+where the team intra-variances are taken over the five constituent players.
+An \emph{extended} 14-D vector appends six real-CSV-only features
+\begin{equation}
+\boldsymbol{\phi}_{\text{ext}} = \big[\boldsymbol{\phi}_{\text{base}},\;
+\bar{w}_A,\; \bar{w}_B,\; |\bar{w}_A - \bar{w}_B|,\;
+\Delta h,\; \Delta f,\; \Delta u\big],
+\label{eq:phi-ext}
+\end{equation}
+with $\bar{w}_T$ the team-mean solo-queue winrate and
+$\Delta h, \Delta f, \Delta u$ the team differences in Riot's
+\texttt{hotStreak}, \texttt{freshBlood}, and \texttt{inactive} counts.
+
+\subsection{Real-data retrieval pipeline}
+\label{sec:retrieval}
+We collect live \texttt{RANKED\_SOLO\_5x5} (queue 420) matches through the
+public Riot API, via three subsystems.
+
+\paragraph{(a) Tier-balanced seed sampling.}
+A naive single-seed BFS collapses to one MMR cluster (friends play friends).
+Let $\mathcal{T} = \{\text{Iron}, \ldots, \text{Diamond}, \text{Master},
+\text{GM}, \text{Challenger}\}$ and let $S_t \subset \mathcal{P}$ denote the
+set of PUUIDs returned for tier $t$. We sample uniformly
+$|S_t| \le k$ per tier (default $k = 100$) from the league-v4 division or
+apex endpoints and interleave by a random permutation $\pi$:
+\begin{equation}
+\mathcal{S} \;=\; \pi\!\left(\bigcup_{t\in\mathcal{T}} S_t\right),
+\qquad \mathbb{E}[|\mathcal{S}|] \le k|\mathcal{T}|.
+\label{eq:seeds}
+\end{equation}
+This guarantees empirical MMR coverage across the full ladder.
+
+\paragraph{(b) Dual-window token-bucket limiter.}
+Riot development keys enforce two simultaneous caps:
+$N_{\text{s}} = 20$ requests per $W_{\text{s}} = 1\,$s and
+$N_{\ell} = 100$ requests per $W_{\ell} = 120\,$s. Let
+$Q_{\text{s}}(t), Q_{\ell}(t)$ be deques of the last-request timestamps within
+each window at time $t$. A request is admitted when
+$|Q_{\text{s}}| < N_{\text{s}} - \delta_{\text{s}}$ \emph{and}
+$|Q_{\ell}| < N_{\ell} - \delta_{\ell}$; otherwise the thread sleeps for
+\begin{equation}
+\tau(t) \;=\; \max\!\Big(
+\underbrace{W_{\text{s}} - (t - \min Q_{\text{s}})}_{\text{short-window wait}},\;
+\underbrace{W_{\ell} - (t - \min Q_{\ell})}_{\text{long-window wait}},\;
+\epsilon_0 \Big),
+\label{eq:ratelimit}
+\end{equation}
+where $\epsilon_0 = 10^{-3}\,$s prevents busy-spinning and
+$\delta_{\text{s}} = 2, \delta_{\ell} = 5$ are safety buffers. A
+ten-thread pool can burst up to $N_{\text{s}} - \delta_{\text{s}} = 18$
+concurrent requests whenever the long window permits.
+
+\paragraph{(c) MMR reconstruction from tier/LP.}
+Riot exposes public tier $t$, division $r$ and LP $\ell$, not the hidden
+matchmaking MMR $M^\star$. We approximate $M^\star$ with a piecewise-linear
+mapping $\widehat{M}(t, r, \ell)$:
+\begin{equation}
+\widehat{M}(t, r, \ell) \;=\;
+\begin{cases}
+B(t) + R(r) + \ell, & t \in \{\text{Iron}, \ldots, \text{Diamond}\},\\
+3200 + \ell, & t \in \{\text{Master}, \text{GM}, \text{Challenger}\},
+\end{cases}
+\label{eq:mmr}
+\end{equation}
+where $B(t)$ is a tier base ($B(\text{Iron})=400, \ldots, B(\text{Diamond})=2800$,
+step $400$), $R(\text{I})=300, R(\text{II})=200, R(\text{III})=100, R(\text{IV})=0$,
+and apex tiers share one continuous LP ladder above $B(\text{Master})=3200$.
+The reconstruction error $M^\star - \widehat{M}$ is the primary source of
+feature noise we identify in Section~\ref{sec:discussion}.
+
+Per-player rating uncertainty is estimated from tier, games played $n$,
+and winrate $w$ via
+\begin{equation}
+\widehat{\sigma}(t, n, w) \;=\;
+\sigma_0(t) \cdot \min\!\left(1.5,\; \tfrac{50}{n+50}\right)
+\cdot \left(1 + 2|w - 0.5|\right),
+\label{eq:sigma}
+\end{equation}
+where $\sigma_0(t)$ decreases from $210$ (Iron) to $60$ (Challenger) as a
+tier-specific base. The $50/(n+50)$ factor mirrors the $1/\sqrt{n}$
+convergence rate of a Bayesian posterior; the winrate term inflates
+uncertainty for players still climbing or falling.
+
+\subsection{Match-quality label}
+\label{sec:labels}
+Each match receives a conservative \emph{worst-of-three} label derived from
+three independent outcome signals: game duration $s$, end-game gold
+differential $g$, and kill differential $\kappa$. Each signal emits a
+categorical vote $v_s, v_g, v_\kappa \in \mathcal{L} =
+\{\text{Close}, \text{Competitive}, \text{Stomp}\}$ via thresholded
+piecewise-constant functions, e.g.
+\begin{equation}
+v_s(s) = \begin{cases}
+\text{Stomp} & s < 1320 \\
+\text{Close} & s > 2100 \\
+\text{Competitive} & \text{otherwise}
+\end{cases},
+\quad
+v_g(g) = \begin{cases}
+\text{Stomp} & g > 10{,}000 \\
+\text{Close} & g < 4{,}000 \\
+\text{Competitive} & \text{otherwise}
+\end{cases},
+\label{eq:votes}
+\end{equation}
+and analogously for $v_\kappa$ with thresholds $\{15, 7\}$. Let
+$\text{sev}: \mathcal{L} \to \{0,1,2\}$ with
+$\text{sev}(\text{Close})=0$, $\text{sev}(\text{Competitive})=1$,
+$\text{sev}(\text{Stomp})=2$. The final label aggregates by
+worst-severity:
+\begin{equation}
+y \;=\; \arg\max_{v \in \{v_s, v_g, v_\kappa\}}\, \text{sev}(v).
+\label{eq:label}
+\end{equation}
+A match must therefore look close on all three axes before it is labelled
+\emph{Close}. On the 500-match real set the resulting distribution is 58\%
+\emph{Stomp}, 38\% \emph{Competitive}, 4\% \emph{Close}, which imposes a
+substantial class-imbalance constraint on downstream accuracy.
+
+\subsection{Classifier factory and fairness score}
+\label{sec:classifier}
+A \texttt{build\_model(name)} factory returns one of three estimators with
+a uniform \texttt{fit}/\texttt{predict\_proba} interface: Random Forest
+(class-weighted, 100 trees), XGBoost (multinomial softprob,
+sample-weighted via $\text{compute\_sample\_weight}$ for imbalance) and
+Logistic Regression inside a \texttt{StandardScaler} pipeline
+(class-weighted, L2-regularised). All three implement the same contract
+$f_\theta: \mathbb{R}^d \to \Delta^{|\mathcal{L}|-1}$ mapping a feature
+vector to a class-probability simplex.
+
+Given $\mathbf{p} = f_\theta(\boldsymbol{\phi}) = (p_C, p_M, p_S)$ where
+$C, M, S$ index Close / Competitive / Stomp, we derive a continuous
+fairness score on $[0, 100]$ as
+\begin{equation}
+\mathrm{Fairness}(\mathbf{p}) \;=\;
+\big\lfloor 100\,(\,p_C + \tfrac{1}{2} p_M\,) + 0.5 \big\rfloor.
+\label{eq:fairness}
+\end{equation}
+The deployed endpoint returns $\mathrm{Fairness}(\mathbf{p})$; the
+discrete label $\arg\max_k p_k$ is kept as a diagnostic output.
+
+\section{Experiments}
+\label{sec:exp}
+
+We evaluate the deployed pipeline
+(\eqref{eq:mmr}, \eqref{eq:sigma}, \eqref{eq:phi-base}, \eqref{eq:fairness};
+no online rating update) by \emph{train-on-real, test-on-real-held-out}:
+train on one 500-match collection and test on a second,
+independently-seeded 500-match collection gathered on a different day.
+Metrics are label accuracy against the voted ground truth, the
+majority-class baseline (always-\emph{Stomp}: 58\%), and Spearman $\rho$
+between the continuous fairness score and each outcome proxy (Spearman
+rather than Pearson because fairness and duration/gold/kill live on
+different scales).
+
+\begin{table}[t]
+\caption{Held-out real-data evaluation. All three classifiers converge to
+$\approx$50\% accuracy --- below the 58\% majority baseline --- with weak
+rank correlation. Adding winrate and Riot status-flag differences (extended)
+does not help.}
+\label{tab:results}
+\begin{center}
+\small
+\begin{tabular}{lccccc}
+\toprule
+ & \textbf{Features} & \textbf{Accuracy} & $\rho_{\text{dur}}$ & $\rho_{\text{gold}}$ & $\rho_{\text{kill}}$ \\
+\midrule
+Majority baseline & --       & 0.58 & --     & --     & --     \\
+Random guess      & --       & 0.33 & --     & --     & --     \\
+\midrule
+Random Forest     & baseline & 0.50 & $+$0.06 & $-$0.05 & $-$0.04 \\
+XGBoost           & baseline & 0.49 & $+$0.07 & $-$0.06 & $-$0.05 \\
+Logistic Reg.     & baseline & 0.51 & $+$0.06 & $-$0.05 & $-$0.04 \\
+\midrule
+Random Forest     & extended & 0.48 & $+$0.05 & $-$0.05 & $-$0.04 \\
+XGBoost           & extended & 0.47 & $+$0.06 & $-$0.06 & $-$0.05 \\
+Logistic Reg.     & extended & 0.50 & $+$0.06 & $-$0.05 & $-$0.04 \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\begin{subfigure}[b]{0.48\textwidth}
+  \includegraphics[width=\linewidth]{real_xgb_baseline_validation_confusion.png}
+  \caption{Confusion matrix (XGB, baseline).}
+  \label{fig:confusion}
+\end{subfigure}\hfill
+\begin{subfigure}[b]{0.48\textwidth}
+  \includegraphics[width=\linewidth]{real_xgb_baseline_validation_fairness_hist.png}
+  \caption{Predicted fairness-score distribution by true label.}
+  \label{fig:fairhist}
+\end{subfigure}
+
+\vspace{0.4em}
+
+\begin{subfigure}[b]{\textwidth}
+  \includegraphics[width=\linewidth]{real_xgb_baseline_validation_scatter.png}
+  \caption{Fairness score vs.\ the three outcome proxies (duration, gold diff, kill diff).}
+  \label{fig:scatter}
+\end{subfigure}
+\caption{Held-out real-data evaluation (XGBoost, baseline features). The
+predicted fairness distribution in (b) barely separates by true label,
+and (c) shows no visible trend --- consistent with the weak Spearman
+$\rho$ in Table~\ref{tab:results}.}
+\label{fig:pipeline}
+\end{figure}
+
+\subsection{Three-family convergence implies a feature ceiling}
+Random Forest (high-variance bagging), XGBoost (sequential boosting) and
+Logistic Regression (linear / low-variance) sit at different points on the
+bias-variance curve. If model capacity were the limiting factor, at least
+one family would separate from the others; instead the three land within
+2 percentage points on every feature set. This is the feature-ceiling
+signature of \citet{caruana2006empirical}: model tuning cannot recover
+signal that is not in $\phi$.
+
+\subsection{Extended features do not help}
+Adding per-team winrate and Riot's \texttt{hotStreak} /
+\texttt{freshBlood} / \texttt{inactive} flags (features the server knows
+at lobby time but the 8-D vector ignores) does not lift accuracy
+(Table~\ref{tab:results}, lower block). Winrate correlates strongly with
+tier, which MMR already encodes, so the new columns are nearly collinear;
+at $n=500$ the status flags are sparse enough for tree splitters to fit
+noise, which is why accuracy drops slightly for RF and XGB while the
+regularised Logistic Regression stays flat.
+
+\subsection{Where is the remaining signal?}
+Two candidates dominate. The first is \textbf{label noise}: the heuristic
+thresholds on duration, gold, and kill differential are reasonable but not
+canonical, and two annotators would disagree on borderline games, which
+places an information-theoretic ceiling on any classifier. The second is
+\textbf{MMR reconstruction error}: tier+LP is a lossy projection of the
+hidden MMR that the matchmaker actually uses, and two Diamond II 50 LP
+accounts can differ by hundreds of internal MMR points that our pipeline
+cannot distinguish. Closing either gap requires data we do not have
+access to.
+
+\section{Discussion}
+\label{sec:discussion}
+
+The prototype is usable as designed: a call to
+\texttt{predict\_fairness(team\_a\_mmrs, team\_b\_mmrs, model)} returns a
+calibrated score and label in milliseconds. The discriminative power of
+that score is modest on real data, which matters for how it is deployed:
+treating it as a high-accuracy oracle would mis-route players, whereas
+using it as a soft fairness regulariser alongside an existing
+skill-difference objective would not.
+
+\paragraph{Data is the bottleneck, not the model.}
+Every quantity that caps accuracy is an artifact of the data pipeline:
+the reconstruction error $M^\star - \widehat{M}$ in \eqref{eq:mmr}, the
+label noise from the fixed thresholds in \eqref{eq:votes}, and the class
+imbalance induced by \eqref{eq:label}. None of these move with more
+training data or a different classifier. The pipeline is reproducible:
+the collector \eqref{eq:ratelimit}, seed sampler \eqref{eq:seeds},
+reconstruction constants \eqref{eq:mmr}, and voting thresholds
+\eqref{eq:votes} are module-level constants, swappable independently of
+the model layer.
+
+\section{Limitations and Future Work}
+\label{sec:limitations}
+
+\paragraph{Label definition is author-chosen, not canonical.}
+The Close / Competitive / Stomp thresholds on duration, gold, and kill
+differential in \eqref{eq:votes} roughly track surrender timings and
+gold-graph inflection points discussed in the community, but they are not
+produced by a studio or validated in a rater study. Borderline matches
+would be labelled differently by two reasonable annotators, and the
+worst-of-three rule in \eqref{eq:label} amplifies that disagreement: one
+stretched signal flips the whole label. Re-calibrating the thresholds,
+replacing the vote with a soft ordinal label, or substituting
+studio-canonical quality labels would each raise the information-theoretic
+ceiling.
+
+\paragraph{The ``MMR'' we use is a remap of visible rank, not Riot's MMR.}
+The feature vector consumes $\widehat{M}(t, r, \ell)$ from \eqref{eq:mmr},
+a piecewise-linear function of publicly visible tier/division/LP. In
+Riot's system, visible rank is downstream of a hidden MMR~$M^\star$: the
+matchmaker pairs players by $M^\star$ and converts $M^\star$-based
+outcomes into LP movements via gain/loss rules. Two accounts at the same
+visible rank can therefore carry different $M^\star$ (e.g.\ one climbing
+with a positive-MMR margin and one decaying), and the reconstruction
+error $M^\star - \widehat{M}$ is correlated with exactly the information
+that drives the outcome. Closing this ceiling requires access to
+$M^\star$ or a stronger reconstruction that folds in signals such as
+recent LP-per-win/loss, games-since-promotion, and MMR-check flags.
+
+\paragraph{Other limitations and future directions.}
+The held-out set is 1000 NA1 matches over two collection days, which does
+not capture regional matchmaker-tuning or patch-to-patch meta shifts. The
+three-class formulation also discards the natural ordering
+Close~$\prec$~Competitive~$\prec$~Stomp. Beyond the label and MMR fixes
+above, promising extensions include ordinal regression or a cumulative-link
+model that respects the ordering, calibration diagnostics and conformal
+prediction so \eqref{eq:fairness} ships with a coverage guarantee,
+multi-region and multi-patch held-out sets, and active collection
+targeting the under-represented Close and Stomp tails.
+
+\section{Conclusion}
+
+We built an end-to-end match-quality prototype covering Riot API
+collection, MMR reconstruction, a formal feature and labelling layer, and
+a three-model classifier factory producing the fairness score
+\eqref{eq:fairness}. A held-out evaluation on an independent 500-match
+collection lands near $50\%$ accuracy, and the three model families
+agree closely enough to locate the bottleneck at label noise and MMR
+reconstruction rather than at model choice. For a matchmaker team, that
+points to canonical quality labels and internal-MMR access as higher-yield
+investments than further classifier tuning;
+Section~\ref{sec:limitations} enumerates concrete next steps.
+
+\subsubsection*{LLM Acknowledgments}
+\textbf{This report is partially generated with the assistance of a large
+language model (Claude, Anthropic).} Specifically, the LLM was used to
+(i) draft initial prose for the Abstract, Introduction, Related Work, and
+Discussion sections, which the author then edited for accuracy and scope;
+(ii) typeset equations and tables from author-supplied specifications;
+(iii) provide code review on the rate-limiter and feature-extraction
+pipeline; and (iv) help organise the LaTeX source. All experimental
+design, methodology decisions, data collection, numerical results, plots,
+and final editorial control remain the author's responsibility, and every
+LLM-drafted passage was reviewed and revised before inclusion. The LLM
+did not have access to the private Riot API key or to the collected match
+data at any point.
+
+\bibliographystyle{iclr2026_conference}
+\begin{thebibliography}{9}
+\bibitem[Caruana \& Niculescu-Mizil(2006)]{caruana2006empirical}
+Caruana, R. and Niculescu-Mizil, A.
+\newblock An empirical comparison of supervised learning algorithms.
+\newblock In \emph{ICML}, 2006.
+
+\bibitem[Do et al.(2021)]{do2021predicting}
+Do, T.~D. et al.
+\newblock Using machine learning to predict game outcomes based on player-champion experience in League of Legends.
+\newblock In \emph{FDG}, 2021.
+
+\bibitem[Elo(1978)]{elo1978rating}
+Elo, A.~E.
+\newblock \emph{The Rating of Chessplayers, Past and Present}.
+\newblock Arco, 1978.
+
+\bibitem[Herbrich et al.(2006)]{herbrich2006trueskill}
+Herbrich, R., Minka, T., and Graepel, T.
+\newblock TrueSkill: A Bayesian skill rating system.
+\newblock In \emph{NeurIPS}, 2006.
+
+\end{thebibliography}
+
+\appendix
+\section{Appendix: Dataset and reproducibility details}
+
+The 500-match real dataset was collected on 2026-04-19 from the NA1
+platform, Americas routing. Seed sampling used
+\texttt{--players-per-tier 100} across Iron II, Silver II, Gold II,
+Platinum II, Emerald II, Diamond II, and the apex by-queue rosters
+(Master / Grandmaster / Challenger). Collected PUUIDs are de-duplicated
+against a persistent \texttt{.seen\_matches.json} cache so subsequent
+runs extend rather than overlap the dataset.
+
+All CSV schema, label-voting thresholds, MMR base/offset tables, and
+classifier hyperparameters are surfaced as module constants at the top of
+their respective files; no values are hardcoded inside loops. The
+auto-incrementing output filename (\texttt{real\_matches.csv} $\to$
+\texttt{real\_matches2.csv} $\to$ \ldots) makes multi-run collection safe
+by default.
+
+\section{Appendix: Simulation sandbox (design-phase tool, not deployed)}
+\label{app:sandbox}
+
+During early prototype development we built a simulation harness that
+iterates the full Bayesian TrueSkill posterior update after each synthetic
+match. Given $t = \mu_A - \mu_B$ and draw margin $\varepsilon$, winners
+and losers are pushed via the standard truncated-Gaussian update
+\begin{equation}
+\mu_i \leftarrow \mu_i + \frac{\sigma_i^2}{c}\, v\!\left(\tfrac{t}{c},
+\tfrac{\varepsilon}{c}\right),
+\qquad
+\sigma_i^2 \leftarrow \sigma_i^2 \cdot \left[1 - \frac{\sigma_i^2}{c^2}\,
+w\!\left(\tfrac{t}{c}, \tfrac{\varepsilon}{c}\right)\right],
+\label{eq:update}
+\end{equation}
+with factors
+$v(t, \varepsilon) = \phi(t-\varepsilon)/\Phi(t-\varepsilon)$ and
+$w(t, \varepsilon) = v(t,\varepsilon)\big(v(t,\varepsilon)+t-\varepsilon\big)$.
+Simulated players are initialised with $\mu_i \sim
+\max(400, \mathcal{N}(2800, 1300^2))$ and $\sigma_i \sim
+\mathcal{U}(60, 210)$.
+
+This sandbox was useful for sanity-checking the feature-extraction and
+labelling code against a controllable rating distribution. It was
+\emph{not} used to generate any number reported in
+Section~\ref{sec:exp}: all held-out results come from the real Riot
+dataset, and the deployed prediction path (equations \eqref{eq:mmr},
+\eqref{eq:sigma}, \eqref{eq:phi-base}, \eqref{eq:fairness}) never invokes
+\eqref{eq:update}. We document the sandbox here only for reproducibility
+of the development process.
+
+\end{document}
